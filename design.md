@@ -59,8 +59,6 @@ Shared Supporting Services:
 - PostgreSQL
 - Redis
 - Celery Worker / Celery Beat
-- Object Storage，可选
-- KMS / Vault，可选
 - Audit / Invocation Logs
 
 部署建议：
@@ -83,7 +81,7 @@ Shared Supporting Services:
 - 异步任务：Celery + Redis，负责长任务、定时任务和必要的后处理
 - 日志：loguru
 - 观测：OpenTelemetry + Prometheus
-- 数据加密：应用层 AES-GCM，主密钥来自 KMS 或环境变量注入
+- 数据加密：应用层 AES-GCM，主密钥来自环境变量注入
 
 ### 3.2 为什么使用五表授权
 
@@ -130,54 +128,61 @@ Provider 的目标是完成功能，不是单纯包装某一个 HTTP API。
 - 优先使用稳定三方库或官方 SDK
 - provider 内部允许有多步编排
 - Gateway 只关心能力契约，不关心 provider 内部调用了几次外部 API
-- 除了定时任务调度之外，不引入通用 Tool Registry 作为前置要求
-- MCP 暴露能力优先由接口配置和能力开关驱动，而不是先设计一个通用注册中心
+- 系统内部维护轻量 ToolRegistry，用于 MCP tools/list 和 API tool execution
+- Registry 在进程启动时从 provider 模块自动加载，不持久化到数据库
+- ToolSpec 定义包含：name、description、input/output schema、execution_mode、provider、handler
+- MCP 暴露能力由 ToolRegistry 中已注册且 enabled 的工具决定
 
 ## 4. 推荐项目结构
 
 结合现有 atlas Python 项目结构，建议使用下面的目录布局：
 
 ```text
-app/
-  api/
-    deps.py
-    routes/
-  core/
-    config.py
-    security.py
-    logging.py
-  auth/
-    service.py
-    sql.py
-  persistence/
-    db.py
-    auth/
-      model.py
-      sql.py
-    credentials/
-      model.py
-      sql.py
-    async_jobs/
-      model.py
-      sql.py
-    audit_logs/
-      model.py
-      sql.py
-  tools/
-  providers/
-    jira/
-    gitlab/
-    kubernetes/
-    jenkins/
-    prometheus/
-    ai/
-  workers/
-  mcp/
-    server.py
-    tools.py
-    executor.py
-
-tests/
+backend
+  app/
+    api/
+      auth/
+      deps.py
+      routes/
+    core/
+      config.py
+      security.py
+      logging.py
+    persistence/
+      db.py
+      auth/
+        model.py
+        sql.py
+      credentials/
+        model.py
+        sql.py
+      task_schedulers/
+        model.py
+        sql.py
+      audit_logs/
+        model.py
+        sql.py
+    tools/
+      registry.py
+      spec.py
+      builtin/
+    providers/
+      jira/
+      gitlab/
+      kubernetes/
+      jenkins/
+      prometheus/
+      ai/
+    workers/
+      celery_app.py
+      tasks.py
+      scheduler.py
+      scheduled_tasks.py
+    mcp/
+      server.py
+      tools.py
+      executor.py
+    tests/
 frontend/
 ```
 
@@ -185,13 +190,15 @@ frontend/
 
 - api/routes 只处理协议、请求参数、响应格式
 - 简单 CRUD 场景可以在 api 层直接调用 persistence 下的 sql 模块，不强制多包一层 service
+- 当多个 service 或模块共享相同数据访问逻辑时，可引入 repository 层做可选封装
 - auth 作为特殊模块处理登录、鉴权和多表授权逻辑
 - persistence 统一放 db、ORM model 和 SQL 访问逻辑
 - 每张表要么使用单文件模式，要么使用表名子目录模式，子目录内固定为 model.py 和 sql.py
 - 授权相关持久化统一收在 persistence/auth 目录，不按 users、roles、permissions、user_roles、role_permissions 再拆成五个目录
-- 不再维护全局 schemas 目录，请求和响应模型按 API 模块就近放置
+- schemas/ 下仅保留 common.py（基类）和 response.py（统一响应格式），业务请求和响应模型按 API 模块就近放置
 - providers 放在 app/providers 下，作为外部系统能力实现
 - API 与 MCP 分别维护自己的入口和执行逻辑，不共享同一个监听端口
+- API 与 MCP 共享 ToolService 和 ToolRegistry，仅入口协议不同
 - 不强制所有 handler 先经过 service，再访问数据库
 
 ## 5. 模块职责
@@ -203,7 +210,7 @@ frontend/
 - 用户登录与会话管理
 - 管理用户、角色、权限
 - 管理凭证和 provider 配置
-- 查看工具目录、调用记录、异步任务
+- 查看工具目录、调用记录、调度任务
 - 查看审计日志和故障原因
 
 ### 5.2 FastAPI Service
@@ -280,38 +287,74 @@ frontend/
 
 职责：
 
-- 编排 API 侧异步友好的复杂执行链路
+- ToolService 负责 tool 执行写路径：创建审计记录、判断 sync/async、投递任务
+- ExecutionService 负责读路径：查询 invocations、查询审计记录
 - 在执行前做鉴权、credential 注入、参数校验
-- 按请求耗时和任务类型决定直接 await 返回还是投递 Celery
+- 按 ToolSpec.execution_mode 决定直接 await 返回还是投递 Celery
 - 记录统一审计与执行日志
 
 说明：
 
+- ToolService 为 API 和 MCP 共享的执行层
+- 按需异步任务不需要独立任务表，Celery 投递后状态回写到业务实体和 audit_logs
 - 只有跨 provider、多步事务、复杂补偿等场景才建议落 service
 - 简单单表或少量查询接口，api 可以直接调用 persistence sql 模块
 
-### 5.8 MCP Execution Service
+### 5.8 MCP Service 执行链路
 
-职责：
+MCP Service 通过 McpExecutor 适配层调用共享 ToolService：
 
-- 编排 MCP 侧同步执行链路
-- 直接服务于 tools/call
-- 复用 provider 和共享基础设施，但不走 API Handler
+- tools/list → ToolService.list_tools() → ToolRegistry
+- tools/call → ToolService.execute()
+
+与 API 的区别仅在于：
+
+- 认证方式不同（MCP 可能使用 token 或 client cert）
+- 响应格式不同（MCP protocol vs REST JSON）
+- 入口端口不同
 
 说明：
 
-- 只有 MCP 协议暴露的能力需要维护 tools/list
-- tools/list 通过实时查询 provider 能力定义、启停配置和权限信息动态生成
+- tools/list 通过实时查询 ToolRegistry 中已注册能力动态生成
 - 首版不单独维护 MCP 能力目录持久化表
 - 如果未来拆分部署，可以通过共享数据库或内部 API 实时获取能力清单
 
-### 5.9 Async Jobs / Workers
+### 5.9 Scheduler & Workers
 
-职责：
+系统的异步能力分为两类，职责和实现方式完全不同：
 
-- 执行长耗时后台任务
-- 处理定时任务、API 后处理、报警事件后的延迟动作、重试和失败回填
-- 基于 Celery Worker / Beat 和 Redis 运行
+#### 定时任务（TaskScheduler）
+
+由 scheduler.py 管理，基于 task_schedulers 表和 Celery Beat：
+
+- 周期性巡检、定时同步、定时清理等需要持续运行的周期任务
+- task_schedulers 表记录任务定义（cron 表达式、启用状态、上次/下次执行时间等）
+- 支持通过 API 创建、停用、删除定时任务
+- Celery Beat 从 task_schedulers 表加载调度计划
+
+#### 按需异步任务
+
+由业务模块直接投递 Celery，不依赖独立任务表：
+
+- API 收到请求后，业务数据先落库（例如报警信息插入 alerts 表）
+- 业务 service 投递 Celery task（如 process_alert.delay(alert_id)）
+- Worker 执行完毕后，将处理结果回写到业务实体本身（如更新 alerts 表的 status、result 字段）
+- 关键操作同时写入 audit_logs 保持审计一致性
+
+这种方式的好处是：不需要维护一张通用 jobs 表来追踪所有异步任务的状态，每个业务实体自己管理自己的处理状态，查询更直接，关系更清晰。
+
+组件：
+
+- celery_app.py：Celery 配置，broker/backend 连接，队列声明
+- tasks.py：按需异步任务实现（由业务模块按需定义）
+- scheduler.py：TaskScheduler，从 task_schedulers 表加载定时任务并注册到 Celery Beat
+
+部署模型：
+
+```
+celery -A app.workers.celery_app worker -c 4
+celery -A app.workers.celery_app beat
+```
 
 ### 5.10 Providers
 
@@ -326,6 +369,7 @@ frontend/
 - providers/prometheus
 - providers/aws
 - providers/ai
+- providers/grafana
 
 每个 provider 下暴露多个 tool，例如：
 
@@ -438,15 +482,28 @@ role_permissions:
 - API 返回成功后的后处理任务
 - 报警消息接入后的异步分析、补偿、通知
 
-执行链路：
+#### 按需异步执行链路
 
-1. 请求进入 API Service 或事件入口
+以报警处理为例：
+
+1. 请求进入 API Service
 2. Auth 和五表 RBAC 校验
-3. Execution Service 判定需要投递 Celery
-4. 写入 audit_logs 和 async_jobs
-5. 投递到 Redis 队列
-6. Celery Worker 执行 provider 或 workflow
-7. 回填 async_jobs 和 audit_logs
+3. 报警数据写入业务表（如 alerts），状态设为 pending
+4. 投递 Celery task（如 process_alert.delay(alert_id)）
+5. API 立即返回 alert_id 和 pending 状态
+6. Worker 执行处理逻辑（诊断、补偿、通知等）
+7. 处理结果回写到 alerts 表（status → succeeded/failed，result 等字段）
+8. 关键操作写入 audit_logs
+
+原则：业务数据和处理状态保存在业务表自身，不经过通用 jobs 表中转。
+
+#### 定时任务执行链路
+
+1. 通过 API 在 task_schedulers 表创建定时任务（包含 cron 表达式、task_name、payload）
+2. Celery Beat 从 task_schedulers 表加载调度计划
+3. 按 cron_expr 到达时触发对应 Celery task
+4. Worker 执行任务实现
+5. 回写 task_schedulers（last_run_at、next_run_at、last_status）
 
 ## 8. API 设计
 
@@ -487,18 +544,20 @@ role_permissions:
 - 管理操作审计和 tool 执行记录统一落在 audit_logs
 - 如果需要展示 MCP 调用历史，直接按 event_type 或 tool_name 过滤 audit_logs
 
-### 8.4 异步任务 API
+### 8.4 定时任务 API
 
-- GET /api/v1/jobs
-- GET /api/v1/jobs/{job_id}
-- POST /api/v1/jobs/{job_id}:cancel
-- GET /api/v1/jobs/{job_id}/result
+- GET /api/v1/task-schedulers — 定时任务列表
+- POST /api/v1/task-schedulers — 创建定时任务
+- GET /api/v1/task-schedulers/{task_id} — 任务详情
+- DELETE /api/v1/task-schedulers/{task_id} — 删除定时任务
+- POST /api/v1/task-schedulers/{task_id}:enable — 启用
+- POST /api/v1/task-schedulers/{task_id}:disable — 停用
+- POST /api/v1/task-schedulers/{task_id}:run — 立即执行一次
 
 ### 8.5 RBAC 管理 API
 
 - GET /api/v1/roles
 - POST /api/v1/roles
-- PATCH /api/v1/roles/{role_id}
 - DELETE /api/v1/roles/{role_id}
 - GET /api/v1/users/{user_id}/roles
 - POST /api/v1/users/{user_id}/roles
@@ -529,7 +588,7 @@ users ───────────────┐
                      ├── user_roles ─────────────┐
                      │                           └── roles ─── role_permissions ─── permissions
                      ├── credentials
-                     ├── async_jobs
+                     ├── task_schedulers
                      └── audit_logs
 ```
 
@@ -664,36 +723,42 @@ users ───────────────┐
 - unique(provider, name)
 - index(provider, status)
 
-### 9.8 async_jobs
+### 9.8 task_schedulers
 
-用途：Celery 异步任务与定时任务实例管理。
+用途：定时任务定义与调度管理。只负责周期性定时任务，按需异步任务的状态由各业务表自行管理。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| id | uuid pk | job 主键 |
-| audit_log_id | uuid fk null | 对应执行或事件日志 |
-| task_name | varchar(255) | Celery task 名称 |
-| job_type | varchar(32) | async, schedule |
-| tool_name | varchar(255) null | 关联工具名 |
-| queue_name | varchar(64) | 队列名 |
-| status | varchar(32) | pending, running, retrying, succeeded, failed, canceled |
-| retry_count | int | 已重试次数 |
-| max_retries | int | 最大重试次数 |
-| worker_name | varchar(128) null | 处理节点 |
-| scheduled_for | timestamptz null | 计划执行时间 |
-| payload_json | jsonb | 投递内容 |
-| result_json | jsonb null | 任务结果 |
-| error_message | text null | 错误信息 |
-| started_at | timestamptz null | 开始时间 |
-| finished_at | timestamptz null | 完成时间 |
+| id | uuid pk | 主键 |
+| name | varchar(128) unique | 任务名称，人类可读 |
+| description | text null | 任务描述 |
+| task_name | varchar(255) | Celery task 全限定名 |
+| cron_expr | varchar(128) | cron 表达式 |
+| queue_name | varchar(64) | 队列名，default: atlas.default |
+| enabled | boolean | 是否启用 |
+| payload_json | jsonb | 任务输入参数 |
+| max_retries | int | 单次执行最大重试次数 |
+| timeout_seconds | int null | 单次执行超时时间 |
+| last_run_at | timestamptz null | 最近一次执行时间 |
+| next_run_at | timestamptz null | 下次计划执行时间 |
+| last_status | varchar(32) null | 上次执行状态：succeeded, failed |
+| last_error | text null | 上次执行错误信息 |
+| run_count | int | 累计执行次数 |
+| created_by | uuid fk null | 创建人 |
 | created_at | timestamptz | 创建时间 |
 | updated_at | timestamptz | 更新时间 |
 
 索引与约束：
 
-- index(audit_log_id)
-- index(status, scheduled_for)
-- index(queue_name, status)
+- unique(name)
+- index(enabled, next_run_at)
+- index(task_name)
+
+说明：
+
+- scheduler.py 中的 TaskScheduler 从此表加载调度计划并注册到 Celery Beat
+- 按需异步任务（如报警处理、tool 异步执行）不经过此表，状态直接回写到业务实体
+- 如需审计定时任务的每次执行细节，由任务实现自行写入 audit_logs
 
 ### 9.9 audit_logs
 
@@ -756,10 +821,11 @@ users ───────────────┐
 
 - 用户、角色、五表 RBAC 授权
 - 凭证管理与加密存储
-- FastAPI 异步执行链路 + Celery 长任务和定时任务
-- MCP tools/list 和 tools/call
+- FastAPI 同步执行链路 + Celery 按需异步任务
+- TaskScheduler 定时任务模块（task_schedulers 表 + Celery Beat）
+- MCP tools/list 和 tools/call（通过共享 ToolService + ToolRegistry）
 - 基于 Redis 的 Celery Worker / Beat
 - Kubernetes、Jenkins、Prometheus 三类 provider
-- audit_logs、async_jobs 全链路记录
+- audit_logs 全链路审计记录
 
 这样可以先把平台骨架、授权边界、数据库骨架和 provider 形态全部定住，后续再横向扩展 Jira、GitLab、Feishu、AI 等 provider。
