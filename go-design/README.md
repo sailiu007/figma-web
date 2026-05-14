@@ -1,0 +1,10 @@
+# go-design
+
+Go 相关设计文档统一放在本目录。
+
+## 文档入口
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [DETAILED_DESIGN.md](DETAILED_DESIGN.md)
+- [QUICK-START.md](QUICK-START.md)
+- [DEPENDENCIES-GUIDE.md](DEPENDENCIES-GUIDE.md)
