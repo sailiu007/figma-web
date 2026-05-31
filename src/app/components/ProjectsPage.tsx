@@ -1,22 +1,29 @@
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useAppStore } from '../../store/useAppStore';
 import { useT } from '../../i18n';
 import TopBar from './TopBar';
-import { Star, Users, Plus, Filter, FolderKanban, Activity, Archive, ChevronRight, ArrowRight } from 'lucide-react';
+import { Activity, Archive, ArrowRight, FolderKanban, Star, Users } from 'lucide-react';
+import {
+  DataGrid,
+  GridProgressCell,
+  GridStatusCell,
+  useDataGridState,
+  type DataGridColumn,
+  type DataGridFieldSchema,
+} from './data-grid';
+import { Button } from './ui/button';
+import type { Project } from '../../types';
 
 export default function ProjectsPage() {
-  const { language, theme, projects, setCurrentProject, toggleStar, setProjectSubPage } = useAppStore();
+  const { language, theme, projects, setCurrentProject, toggleStar, setProjectSubPage, addProject, updateProject, showToast } = useAppStore();
   const t = useT(language);
   const navigate = useNavigate();
-  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'planning' | 'archived'>('all');
-  const [search, setSearch] = useState('');
-
-  const filtered = useMemo(() =>
-    projects.filter(p =>
-      (statusFilter === 'all' || p.status === statusFilter) &&
-      (!search || p.name.includes(search) || p.nameEn.toLowerCase().includes(search.toLowerCase()))
-    ), [projects, statusFilter, search]);
+  const grid = useDataGridState({
+    filters: {},
+    pageSize: 8,
+    visibleColumnKeys: ['star', 'name', 'status', 'progress', 'members', 'updatedAt', 'actions'],
+  });
 
   const stats = [
     { key: 'totalProjects', icon: FolderKanban, value: projects.length, color: '#8b5cf6,#6d28d9' },
@@ -31,63 +38,185 @@ export default function ProjectsPage() {
     navigate(`/projects/${id}`);
   };
 
-  const statusBadge = (s: string) => {
-    const map: Record<string, React.CSSProperties> = theme === 'light'
-      ? {
-        active: {
-          background: 'oklch(0.92 0.05 160)',
-          color: 'oklch(0.46 0.14 160)',
-          borderColor: 'oklch(0.78 0.08 160)',
-        },
-        archived: {
-          background: 'oklch(0.93 0.01 255)',
-          color: 'oklch(0.5 0.03 255)',
-          borderColor: 'oklch(0.8 0.02 255)',
-        },
-        planning: {
-          background: 'oklch(0.95 0.05 90)',
-          color: 'oklch(0.54 0.12 88)',
-          borderColor: 'oklch(0.82 0.08 90)',
-        },
-      }
-      : {
-        active: {
-          background: 'oklch(0.70 0.15 155 / 0.18)',
-          color: 'oklch(0.78 0.13 155)',
-          borderColor: 'oklch(0.70 0.15 155 / 0.32)',
-        },
-        archived: {
-          background: 'oklch(0.68 0.02 255 / 0.18)',
-          color: 'oklch(0.78 0.02 255)',
-          borderColor: 'oklch(0.72 0.02 255 / 0.28)',
-        },
-        planning: {
-          background: 'oklch(0.78 0.14 75 / 0.18)',
-          color: 'oklch(0.84 0.13 75)',
-          borderColor: 'oklch(0.78 0.14 75 / 0.30)',
-        },
-      };
-    const dotColor: Record<string, string> = theme === 'light'
-      ? {
-        active: 'oklch(0.56 0.12 160)',
-        archived: 'oklch(0.56 0.03 255)',
-        planning: 'oklch(0.62 0.11 88)',
-      }
-      : {
-        active: 'oklch(0.78 0.13 155)',
-        archived: 'oklch(0.78 0.02 255)',
-        planning: 'oklch(0.84 0.13 75)',
-      };
-    const labels: Record<string, string> = {
-      active: t('statusActive'), archived: t('statusArchived'), planning: t('statusPlanning'),
-    };
-    return (
-      <span className="px-2.5 py-1 rounded-full text-xs border inline-flex items-center gap-1.5" style={{ fontWeight: 600, ...map[s] }}>
-        <span aria-hidden="true" style={{ color: dotColor[s] }}>●</span>
-        {labels[s]}
-      </span>
-    );
+  const statusTone: Record<string, 'success' | 'warning' | 'neutral'> = {
+    active: 'success',
+    planning: 'warning',
+    archived: 'neutral',
   };
+
+  const statusOptions = useMemo(() => [
+    { label: t('statusActive' as any), value: 'active' },
+    { label: t('statusPlanning' as any), value: 'planning' },
+    { label: t('statusArchived' as any), value: 'archived' },
+  ], [t]);
+
+  const editableProjectFieldKeys = useMemo(() => ['name', 'nameEn', 'description', 'status', 'progress', 'members'], []);
+
+  const projectFields = useMemo<Array<DataGridFieldSchema>>(() => [
+    {
+      key: 'name',
+      label: t('name'),
+      kind: 'text',
+      required: true,
+      placeholder: '输入项目名称',
+      createable: true,
+    },
+    {
+      key: 'nameEn',
+      label: language === 'zh' ? '英文名称' : 'English name',
+      kind: 'text',
+      required: true,
+      placeholder: language === 'zh' ? '输入英文名称' : 'Enter English name',
+      createable: true,
+    },
+    {
+      key: 'description',
+      label: language === 'zh' ? '项目描述' : 'Description',
+      kind: 'text',
+      required: true,
+      placeholder: language === 'zh' ? '输入项目描述' : 'Enter project description',
+      multiline: true,
+      rows: 5,
+      createable: true,
+    },
+    {
+      key: 'status',
+      label: t('status'),
+      kind: 'single-select',
+      options: statusOptions,
+      required: true,
+      defaultValue: 'planning',
+      createable: true,
+    },
+    {
+      key: 'progress',
+      label: t('progress'),
+      kind: 'number',
+      required: true,
+      defaultValue: 0,
+      placeholder: '0 - 100',
+      createable: true,
+      validate: (value) => {
+        const numeric = Number(value);
+        if (Number.isNaN(numeric) || numeric < 0 || numeric > 100) {
+          return '进度需在 0 到 100 之间';
+        }
+      },
+    },
+    {
+      key: 'members',
+      label: t('members'),
+      kind: 'number',
+      required: true,
+      defaultValue: 1,
+      placeholder: '输入成员数',
+      createable: true,
+      validate: (value) => {
+        const numeric = Number(value);
+        if (!Number.isInteger(numeric) || numeric <= 0) {
+          return '成员数需为大于 0 的整数';
+        }
+      },
+    },
+  ], [language, statusOptions, t]);
+
+  const columns = useMemo<Array<DataGridColumn<(typeof projects)[number]>>>(() => [
+    {
+      key: 'star',
+      title: '',
+      width: 52,
+      filterable: false,
+      render: (project) => (
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            toggleStar(project.id);
+          }}
+          className="rounded-full p-1 transition-colors hover:bg-background/50"
+          aria-label={project.starred ? 'Unstar project' : 'Star project'}
+        >
+          <Star className={`size-4 transition-all ${project.starred ? 'fill-amber-400 text-amber-400' : 'text-muted-foreground/50 hover:text-amber-400'}`} />
+        </button>
+      ),
+    },
+    {
+      key: 'name',
+      fieldKey: 'name',
+      title: t('name'),
+      type: 'entity',
+      sortable: true,
+      groupable: true,
+      width: '32%',
+      meta: {
+        isPrimary: true,
+        titleField: language === 'zh' ? 'name' : 'nameEn',
+        descriptionField: 'description',
+        accentField: 'color',
+      },
+      sortValue: (project) => language === 'zh' ? project.name : project.nameEn,
+      groupValue: (project) => {
+        const value = language === 'zh' ? project.name : project.nameEn;
+        return value.slice(0, 1).toUpperCase();
+      },
+    },
+    {
+      key: 'status',
+      fieldKey: 'status',
+      title: t('status'),
+      type: 'status',
+      sortable: true,
+      groupable: true,
+      sortValue: (project) => project.status,
+      groupValue: (project) => project.status,
+      meta: { statusToneByValue: statusTone },
+    },
+    {
+      key: 'progress',
+      fieldKey: 'progress',
+      title: t('progress'),
+      type: 'progress',
+      sortable: true,
+      align: 'left',
+      sortValue: (project) => project.progress,
+      meta: theme === 'light' ? { accentField: 'color' } : undefined,
+    },
+    {
+      key: 'members',
+      fieldKey: 'members',
+      title: t('members'),
+      type: 'avatar-list',
+      sortable: true,
+      sortValue: (project) => project.members,
+      meta: { avatarColors },
+    },
+    {
+      key: 'updatedAt',
+      fieldKey: 'updatedAt',
+      title: t('updated'),
+      type: 'date',
+      sortable: true,
+      sortValue: (project) => project.updatedAt,
+    },
+    {
+      key: 'actions',
+      title: t('actions'),
+      width: 144,
+      align: 'right',
+      filterable: false,
+      render: (project) => (
+        <Button
+          onClick={(event) => {
+            event.stopPropagation();
+            enterProject(project.id);
+          }}
+          className="gradient-button h-8 rounded-lg px-3 text-xs"
+        >
+          {t('enterProject')}
+          <ArrowRight className="size-3" />
+        </Button>
+      ),
+    },
+  ], [enterProject, language, t, theme, toggleStar]);
 
   return (
     <div className="p-5 h-full overflow-auto">
@@ -111,108 +240,136 @@ export default function ProjectsPage() {
         })}
       </div>
 
-      <div className="glass-card p-5 rounded-[28px]">
-        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
-            {(['all', 'active', 'planning', 'archived'] as const).map(s => (
-              <button
-                key={s}
-                onClick={() => setStatusFilter(s)}
-                className={`px-3.5 py-1.5 rounded-full text-sm transition-all ${statusFilter === s ? 'gradient-button' : 'glass-button'
-                  }`}
-                style={{ fontWeight: 500 }}
-              >
-                {s === 'all' ? t('all') : t(`status${s.charAt(0).toUpperCase() + s.slice(1)}` as any)}
-              </button>
-            ))}
-          </div>
-          <div className="flex items-center gap-2">
-            <input
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              placeholder={t('search')}
-              className="glass-input rounded-full px-4 py-2 text-sm w-44 outline-none"
-            />
-            <button className="glass-button rounded-full w-10 h-10 flex items-center justify-center"><Filter className="w-4 h-4" /></button>
-            <button className="gradient-button rounded-full px-4 py-2 flex items-center gap-1.5 text-sm">
-              <Plus className="w-4 h-4" /> {t('create')}
-            </button>
-          </div>
-        </div>
+      <div className="glass-card rounded-[28px] p-5">
+        <DataGrid
+          data={projects}
+          columns={columns}
+          fields={projectFields}
+          rowKey={(project) => project.id}
+          grid={grid}
+          addRecordLabel="添加记录"
+          createRecord={{
+            title: language === 'zh' ? '新增项目' : 'New project',
+            description: language === 'zh' ? '基于字段规则创建项目。' : 'Create a project from the field schema.',
+            submitLabel: language === 'zh' ? '创建项目' : 'Create project',
+            fields: editableProjectFieldKeys,
+            onSubmit: (values) => {
+              const color = projectColors[projects.length % projectColors.length];
+              const now = new Date();
+              const project: Project = {
+                id: crypto.randomUUID(),
+                name: String(values.name ?? ''),
+                nameEn: String(values.nameEn ?? ''),
+                description: String(values.description ?? ''),
+                status: (values.status as Project['status']) ?? 'planning',
+                owner: language === 'zh' ? '系统' : 'System',
+                ownerAvatar: '',
+                updatedAt: formatDateTime(now),
+                createdAt: formatDate(now),
+                members: Number(values.members ?? 1),
+                progress: Number(values.progress ?? 0),
+                tags: [],
+                color,
+                starred: false,
+              };
 
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-muted-foreground table-head" style={{ fontSize: '.72rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.08em' }}>
-              <th className="py-2.5 px-3 w-8"></th>
-              <th className="py-2.5 px-3">{t('name')}</th>
-              <th className="py-2.5 px-3">{t('status')}</th>
-              <th className="py-2.5 px-3">{t('progress')}</th>
-              <th className="py-2.5 px-3">{t('members')}</th>
-              <th className="py-2.5 px-3">{t('updated')}</th>
-              <th className="py-2.5 px-3 w-24">{t('actions')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((p, i) => (
-              <tr
-                key={p.id}
-                onClick={() => enterProject(p.id)}
-                className="row-enter cursor-pointer transition-all duration-300 table-row"
-                style={{ animationDelay: `${i * 25}ms` }}
-              >
-                <td className="py-3 px-3">
-                  <button onClick={e => { e.stopPropagation(); toggleStar(p.id); }}>
-                    <Star className={`w-4 h-4 transition-all ${p.starred ? 'fill-amber-400 text-amber-400' : 'text-muted-foreground/50 hover:text-amber-400'}`} />
-                  </button>
-                </td>
-                <td className="py-3 px-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-xl flex items-center justify-center text-white shrink-0 shadow-md" style={{ background: `linear-gradient(135deg, ${p.color}, ${p.color}aa)`, fontWeight: 700 }}>
-                      {(language === 'zh' ? p.name : p.nameEn).slice(0, 1).toUpperCase()}
-                    </div>
-                    <div className="min-w-0">
-                      <div className="truncate" style={{ fontWeight: 600 }}>{language === 'zh' ? p.name : p.nameEn}</div>
-                      <div className="text-xs text-muted-foreground truncate max-w-[280px]">{p.description}</div>
-                    </div>
-                  </div>
-                </td>
-                <td className="py-3 px-3">{statusBadge(p.status)}</td>
-                <td className="py-3 px-3">
-                  <div className="flex items-center gap-2">
-                    <div className="w-20 h-1.5 rounded-full bg-border/80 overflow-hidden">
-                      <div className="h-full rounded-full" style={{ width: `${p.progress}%`, background: `linear-gradient(90deg, ${p.color}, ${p.color}cc)` }} />
-                    </div>
-                    <span className="text-xs text-muted-foreground" style={{ fontWeight: 500 }}>{p.progress}%</span>
-                  </div>
-                </td>
-                <td className="py-3 px-3">
-                  <div className="flex -space-x-2">
-                    {Array.from({ length: Math.min(p.members, 4) }).map((_, i) => (
-                      <div key={i} className="w-7 h-7 rounded-full border-2 flex items-center justify-center text-white text-xs"
-                        style={{ background: avatarColors[i % avatarColors.length], borderColor: 'rgba(20,20,40,.95)', fontWeight: 600 }}>
-                        {String.fromCharCode(65 + i)}
-                      </div>
+              addProject(project);
+              showToast(language === 'zh' ? '项目已创建' : 'Project created');
+            },
+          }}
+          editRecord={{
+            title: language === 'zh' ? '编辑项目' : 'Edit project',
+            description: (project) => language === 'zh' ? `更新 ${project.name} 的字段信息。` : `Update fields for ${project.nameEn}.`,
+            submitLabel: language === 'zh' ? '保存修改' : 'Save changes',
+            fields: editableProjectFieldKeys,
+            onSubmit: (project, values) => {
+              updateProject(project.id, {
+                name: String(values.name ?? project.name),
+                nameEn: String(values.nameEn ?? project.nameEn),
+                description: String(values.description ?? project.description),
+                status: (values.status as Project['status']) ?? project.status,
+                progress: Number(values.progress ?? project.progress),
+                members: Number(values.members ?? project.members),
+                updatedAt: formatDateTime(new Date()),
+              });
+
+              showToast(language === 'zh' ? '项目已更新' : 'Project updated');
+            },
+          }}
+          searchPlaceholder={t('search')}
+          searchPredicate={(project, search) => {
+            const lowered = search.toLowerCase();
+            return (
+              project.name.toLowerCase().includes(lowered) ||
+              project.nameEn.toLowerCase().includes(lowered) ||
+              project.description.toLowerCase().includes(lowered)
+            );
+          }}
+          detailDrawer={{
+            title: (project) => language === 'zh' ? project.name : project.nameEn,
+            description: (project) => project.description,
+            renderContent: (project) => (
+              <div className="space-y-6">
+                <div className="grid grid-cols-2 gap-3">
+                  <InfoCard label={t('status')} value={<GridStatusCell label={t(`status${project.status.charAt(0).toUpperCase() + project.status.slice(1)}` as any)} tone={statusTone[project.status]} />} />
+                  <InfoCard label={t('progress')} value={<GridProgressCell value={project.progress} accent={theme === 'light' ? project.color : undefined} />} />
+                  <InfoCard label={t('members')} value={<span className="font-semibold">{project.members}</span>} />
+                  <InfoCard label={t('updated')} value={<span className="font-semibold">{project.updatedAt}</span>} />
+                </div>
+                <div className="glass-soft rounded-3xl border border-border/60 p-4">
+                  <div className="mb-2 text-sm font-semibold">Overview</div>
+                  <p className="text-muted-foreground text-sm leading-6">{project.description}</p>
+                </div>
+                <div className="glass-soft rounded-3xl border border-border/60 p-4">
+                  <div className="mb-3 text-sm font-semibold">Tags</div>
+                  <div className="flex flex-wrap gap-2">
+                    {project.tags.map((tag) => (
+                      <span key={tag} className="rounded-full border border-border/60 bg-background/40 px-3 py-1 text-xs font-medium">
+                        {tag}
+                      </span>
                     ))}
-                    {p.members > 4 && (
-                      <div className="w-7 h-7 rounded-full border-2 glass-soft flex items-center justify-center text-xs" style={{ borderColor: 'rgba(20,20,40,.95)', fontWeight: 600 }}>
-                        +{p.members - 4}
-                      </div>
-                    )}
                   </div>
-                </td>
-                <td className="py-3 px-3 text-muted-foreground text-xs">{p.updatedAt}</td>
-                <td className="py-3 px-3">
-                  <button onClick={e => { e.stopPropagation(); enterProject(p.id); }} className="gradient-button rounded-lg px-3 py-1 flex items-center gap-1 text-xs">
-                    {t('enterProject')}<ArrowRight className="w-3 h-3" />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                </div>
+                <div className="flex justify-end">
+                  <Button className="gradient-button rounded-full px-4" onClick={() => enterProject(project.id)}>
+                    {t('enterProject')}
+                    <ArrowRight className="size-4" />
+                  </Button>
+                </div>
+              </div>
+            ),
+          }}
+          renderBulkActions={(selectedProjects) => (
+            <span className="text-muted-foreground text-xs">{selectedProjects.length} projects ready</span>
+          )}
+          getRowClassName={() => 'row-enter transition-all duration-300'}
+        />
       </div>
     </div>
   );
 }
 
+function formatDate(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function formatDateTime(date: Date) {
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  return `${formatDate(date)} ${hours}:${minutes}`;
+}
+
+function InfoCard({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="glass-soft rounded-3xl border border-border/60 p-4">
+      <div className="text-muted-foreground mb-2 text-xs font-medium uppercase tracking-[0.08em]">{label}</div>
+      <div>{value}</div>
+    </div>
+  );
+}
+
 const avatarColors = ['#8b5cf6', '#22d3ee', '#10b981', '#f59e0b', '#ec4899', '#06b6d4'];
+const projectColors = ['#6366f1', '#ec4899', '#14b8a6', '#f59e0b', '#8b5cf6', '#06b6d4'];

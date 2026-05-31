@@ -22,6 +22,8 @@ interface AppState {
   currentProjectId: string | null;
   setCurrentProject: (id: string | null) => void;
   toggleStar: (id: string) => void;
+  addProject: (project: Project) => void;
+  updateProject: (id: string, patch: Partial<Project>) => void;
 
   roles: Role[];
   permissions: typeof mockPermissions;
@@ -47,7 +49,7 @@ interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
   language: 'zh',
   setLanguage: (language) => set({ language }),
-  theme: 'dark',
+  theme: 'light',
   setTheme: (theme) => {
     document.documentElement.classList.toggle('light', theme === 'light');
     document.documentElement.classList.toggle('dark', theme === 'dark');
@@ -69,6 +71,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   setCurrentProject: (id) => set({ currentProjectId: id }),
   toggleStar: (id) => set((s) => ({
     projects: s.projects.map(p => p.id === id ? { ...p, starred: !p.starred } : p)
+  })),
+  addProject: (project) => set((s) => ({
+    projects: [project, ...s.projects],
+    currentProjectId: project.id,
+  })),
+  updateProject: (id, patch) => set((s) => ({
+    projects: s.projects.map((project) => project.id === id ? { ...project, ...patch } : project),
   })),
 
   roles: mockRoles,
